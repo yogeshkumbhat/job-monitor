@@ -68,8 +68,9 @@
   <div id="hint">Drag a box over the <b>right edge</b> of the Create graph (last ~1 min of bars).</div>
   <div id="start">
     <h1>Bar Watch</h1>
-    <p>Point the camera at the Datadog graph. If no green bars show up in the watch zone for the set time, the phone beeps until bars come back.</p>
-    <button id="go" class="primary">Start camera</button>
+    <p>Watch the Datadog graph. If no green bars show up in the watch zone for the set time, it beeps until bars come back.</p>
+    <button id="go" class="primary">Use camera</button>
+    <p style="font-size:13px">Camera: point this device's camera at the screen showing Datadog. You should hear a short chirp when it starts; that confirms sound works.</p>
     <p id="err"></p>
   </div>
 </div>
@@ -105,7 +106,7 @@ $('timeout').value = timeoutS; $('thresh').value = threshPct;
 let lastSeen = Date.now(), alarming = false, silencedUntilBars = false, history = [];
 
 // ---------- Audio (works with iOS silent switch via audioSession + <audio>) ----------
-let actx, beepAudio, unlocked = false;
+let actx, beepAudio, unlocked = false, testing = false;
 function makeBeepWav() {
   const sr = 22050, dur = 1.0, n = sr * dur, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
   const w = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
@@ -119,36 +120,80 @@ function makeBeepWav() {
   }
   return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
 }
+// iOS only lets a page make sound later if it made real (unmuted) sound during a tap.
+// So Start plays a short audible chirp, and we keep a Web Audio context running for the alarm.
 function unlockAudio() {
-  if (unlocked) return; unlocked = true;
   try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch {}
-  if (!beepAudio) { beepAudio = new Audio(makeBeepWav()); beepAudio.loop = true; beepAudio.volume = 1; }
-  beepAudio.muted = true;
-  beepAudio.play().then(() => { beepAudio.pause(); beepAudio.currentTime = 0; beepAudio.muted = false; }).catch(() => { beepAudio.muted = false; });
-  try { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); actx.resume(); } catch {}
+  if (!beepAudio) { beepAudio = new Audio(makeBeepWav()); beepAudio.loop = true; }
+  if (!actx) {
+    try {
+      actx = new (window.AudioContext || window.webkitAudioContext)();
+      const keep = actx.createOscillator(), g = actx.createGain();
+      g.gain.value = 0; keep.connect(g).connect(actx.destination); keep.start();
+    } catch {}
+  }
+  if (actx && actx.state !== 'running') actx.resume().catch(() => {});
+  if (!unlocked) {
+    unlocked = true;
+    chirp(0.15);
+    beepAudio.play().then(() => setTimeout(() => { if (!alarming && !testing) { beepAudio.pause(); beepAudio.currentTime = 0; } }, 120)).catch(() => {});
+  }
 }
-function startSound() { if (beepAudio) { beepAudio.currentTime = 0; beepAudio.play().catch(() => {}); } }
-function stopSound() { if (beepAudio) beepAudio.pause(); }
+function chirp(dur = 0.15, freq = 1046, at = 0) {
+  if (!actx) return;
+  const t = actx.currentTime + at, o = actx.createOscillator(), g = actx.createGain();
+  o.type = 'square'; o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.6, t + 0.01);
+  g.gain.setValueAtTime(0.6, t + dur - 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(actx.destination); o.start(t); o.stop(t + dur + 0.02);
+}
+let beepTimer = null;
+function beepBurst() { chirp(0.15, 880, 0); chirp(0.15, 1175, 0.25); chirp(0.15, 880, 0.5); }
+function startSound() {
+  if (actx && actx.state !== 'running') actx.resume().catch(() => {});
+  if (beepAudio) { beepAudio.currentTime = 0; beepAudio.play().catch(() => {}); }
+  if (!beepTimer) { beepBurst(); beepTimer = setInterval(beepBurst, 1000); }
+  if (navigator.vibrate) navigator.vibrate([400, 200, 400]);
+}
+function stopSound() {
+  if (beepAudio) beepAudio.pause();
+  clearInterval(beepTimer); beepTimer = null;
+}
+// Any tap re-wakes audio if iOS suspended it (e.g. after a call or notification).
+document.addEventListener('pointerdown', () => { if (unlocked && actx && actx.state !== 'running') actx.resume().catch(() => {}); });
 
 // ---------- Wake lock ----------
 let wakeLock;
 async function keepAwake() { try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {} }
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && video.srcObject) keepAwake(); });
 
-// ---------- Camera ----------
+// ---------- Video source ----------
+// Ticks come from a worker so Chrome doesn't throttle checks when this tab is in the background.
+let ticker;
+function begin(stream) {
+  video.srcObject = stream;
+  return video.play().then(() => {
+    $('start').hidden = true; roiEl.hidden = false; lastSeen = Date.now();
+    keepAwake(); layoutRoi();
+    if (!ticker) {
+      ticker = new Worker(URL.createObjectURL(new Blob(['setInterval(() => postMessage(0), 500)'], { type: 'text/javascript' })));
+      ticker.onmessage = tick;
+    }
+    stream.getVideoTracks()[0].addEventListener('ended', () => {
+      $('start').hidden = false; roiEl.hidden = true;
+      $('err').textContent = 'The camera turned off. Tap Use camera to start again.';
+    });
+  });
+}
 $('go').onclick = async () => {
   unlockAudio();
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
-    video.srcObject = stream; await video.play();
-    $('start').hidden = true; roiEl.hidden = false; lastSeen = Date.now();
-    keepAwake(); layoutRoi(); setInterval(tick, 500);
+    await begin(await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false }));
   } catch (e) {
-    $('err').textContent = 'Camera blocked: ' + e.message + '. Allow camera for this site in Safari settings (aA → Website Settings) and reload.';
+    $('err').textContent = 'Camera blocked: ' + e.message + '. Allow camera for this site in the browser settings and reload.';
   }
 };
-
 // Displayed video content rect inside the stage (object-fit: contain)
 function contentRect() {
   const W = stage.clientWidth, H = stage.clientHeight, vw = video.videoWidth || 16, vh = video.videoHeight || 9;
@@ -163,31 +208,40 @@ window.addEventListener('resize', layoutRoi);
 video.addEventListener('loadedmetadata', layoutRoi);
 
 // Draw a new ROI by dragging
-let dragStart = null;
+let dragStart = null, dragged = false;
 const pt = e => { const b = stage.getBoundingClientRect(), r = contentRect();
   return { x: Math.min(1, Math.max(0, (e.clientX - b.left - r.x) / r.w)), y: Math.min(1, Math.max(0, (e.clientY - b.top - r.y) / r.h)) }; };
-stage.addEventListener('pointerdown', e => { if (!$('start').hidden) return; dragStart = pt(e); stage.setPointerCapture(e.pointerId); });
+stage.addEventListener('pointerdown', e => { if (!$('start').hidden) return; dragStart = pt(e); dragged = false; stage.setPointerCapture(e.pointerId); });
 stage.addEventListener('pointermove', e => {
   if (!dragStart) return; const p = pt(e);
   const n = { x: Math.min(dragStart.x, p.x), y: Math.min(dragStart.y, p.y), w: Math.abs(p.x - dragStart.x), h: Math.abs(p.y - dragStart.y) };
-  if (n.w > 0.02 && n.h > 0.02) { roi = n; layoutRoi(); }
+  if (n.w > 0.02 && n.h > 0.02) { roi = n; dragged = true; layoutRoi(); }
 });
-stage.addEventListener('pointerup', () => { if (dragStart) { dragStart = null; save('roi', roi); lastSeen = Date.now(); } });
+stage.addEventListener('pointerup', () => { if (dragStart && dragged) { save('roi', roi); lastSeen = Date.now(); } dragStart = null; });
 
 // ---------- Detection ----------
 // Datadog's bars are a light green (~#7cc77c). Count pixels whose green channel clearly dominates.
+// Datadog's bars are a light green (~#7cc77c). A pixel counts if green clearly dominates,
+// and only when it sits in a vertical run of green (a bar), so moire/colour noise on white is ignored.
+const MIN_RUN = 5;
 function greenFraction() {
   const vw = video.videoWidth, vh = video.videoHeight; if (!vw) return 0;
   const sx = roi.x * vw, sy = roi.y * vh, sw = roi.w * vw, sh = roi.h * vh;
-  wctx.drawImage(video, sx, sy, sw, sh, 0, 0, work.width, work.height);
-  const d = wctx.getImageData(0, 0, work.width, work.height).data;
+  const W = work.width, H = work.height;
+  wctx.drawImage(video, sx, sy, sw, sh, 0, 0, W, H);
+  const d = wctx.getImageData(0, 0, W, H).data;
   let g = 0;
-  for (let i = 0; i < d.length; i += 4) {
-    const R = d[i], G = d[i + 1], B = d[i + 2];
-    const max = Math.max(R, G, B), min = Math.min(R, G, B);
-    if (G === max && G > 70 && G - R > 18 && G - B > 12 && (max - min) / max > 0.18) g++;
+  for (let x = 0; x < W; x++) {
+    let run = 0, colHits = 0, best = 0;
+    for (let y = 0; y < H; y++) {
+      const i = (y * W + x) * 4, R = d[i], G = d[i + 1], B = d[i + 2];
+      const max = Math.max(R, G, B), min = Math.min(R, G, B);
+      const green = G === max && G > 70 && G - R > 25 && G - B > 25 && (max - min) / max > 0.2;
+      if (green) { run++; colHits++; if (run > best) best = run; } else run = 0;
+    }
+    if (best >= MIN_RUN) g += colHits;
   }
-  return 100 * g / (work.width * work.height);
+  return 100 * g / (W * H);
 }
 
 function tick() {
@@ -209,6 +263,7 @@ function tick() {
   $('quiet').textContent = Math.floor(quiet) + 's';
   $('clock').textContent = Math.floor(quiet) + ' / ' + timeoutS + 's';
   drawSpark();
+  window.__bw = { pct, quiet, alarming, beeping: !!beepTimer, audio: actx && actx.state };
 }
 
 function drawSpark() {
@@ -228,10 +283,9 @@ function syncLabels() { $('timeoutV').textContent = timeoutS + 's'; $('threshV')
 $('timeout').oninput = e => { timeoutS = +e.target.value; save('timeout', timeoutS); syncLabels(); };
 $('thresh').oninput = e => { threshPct = +e.target.value; save('thresh', threshPct); syncLabels(); };
 $('stop').onclick = () => { silencedUntilBars = true; alarming = false; stopSound(); };
-let testing = false;
 $('test').onclick = () => {
   unlockAudio(); testing = !testing;
-  if (testing) { setTimeout(startSound, 150); $('test').textContent = 'Stop test'; }
+  if (testing) { startSound(); $('test').textContent = 'Stop test'; }
   else { stopSound(); $('test').textContent = 'Test sound'; }
 };
 syncLabels();
